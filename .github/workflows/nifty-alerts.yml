@@ -1,0 +1,207 @@
+ # Save this in your repo as:  .github/workflows/nifty-alerts.yml
+#
+# Runs the NIFTY 5m alert bot every trading day on GitHub's servers, free,
+# on your EXISTING Kotak Neo (or ICICI Direct) account. No second demat needed.
+#
+# WHY THIS WORKS ON A DYNAMIC IP
+#   Kotak Neo's docs: "IP validation is enforced only on order APIs."
+#   Login, Data, Portfolio, Report and Websocket APIs are exempt. This bot only
+#   logs in and reads data - it never places an order - so GitHub's random runner
+#   IPs are fine. Same for ICICI Direct Breeze.
+#
+# WHY THIS IS FREE
+#   GitHub Actions minutes are unlimited and unmetered on PUBLIC repositories.
+#   Credentials live in encrypted repository Secrets, never in the code.
+#
+# TIMING
+#   GitHub cron is UTC. IST = UTC + 5:30.
+#     03:50 UTC = 09:20 IST   (job starts; no entries before 09:30 anyway)
+#     + 355 min = 15:15 IST   (GitHub's hard cap is 360 min per job)
+#   GitHub's scheduler is best-effort and can start 5-20 minutes late.
+
+name: NIFTY 5m alerts
+
+on:
+  schedule:
+    - cron: '50 3 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: nifty-alerts
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # needed to commit bars.csv back to the repo
+
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          # cache:'pip' is deliberately NOT set here. It requires a dependency
+          # file to hash, and if requirements.txt is ever missing or renamed the
+          # whole job fails before it runs a single line of Python - with a
+          # message that wrongly blames checkout. Caching saves ~20 seconds on a
+          # job that runs for six hours. Not worth the fragility.
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "requirements.txt not found - installing known-good ranges"
+            pip install 'pandas>=2.0,<3.0' 'numpy>=1.24,<3.0' \
+                        'requests>=2.28,<3.0' 'pyotp>=2.8,<3.0'
+          fi
+          # Broker SDK depends on which broker you chose.
+          if [ "${{ vars.BROKER || 'kotak' }}" = "breeze" ]; then
+            pip install breeze-connect
+          else
+            pip install 'kotakneoapi>=3.0.1'
+          fi
+          python -c "import pandas, numpy, requests, pyotp; print('deps OK')"
+
+      # Copy-pasting a long Python file through a phone browser reliably injects
+      # invisible characters: zero-width spaces, non-breaking spaces, and smart
+      # quotes from iOS autocorrect. Python then dies with things like
+      #   SyntaxError: invalid non-printable character U+200B
+      # pointing at a line that looks completely normal, because the character
+      # has no width. This step strips them before the bot runs, so a bad paste
+      # is a warning in the log instead of a dead morning.
+      - name: Repair invisible characters from mobile paste
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys, unicodedata
+
+          # delete outright - these are zero-width and never belong in source
+          DELETE = "​‌‍⁠﻿᠎"
+          # normalise to their ASCII equivalent
+          REPLACE = {
+              " ": " ", " ": " ", " ": " ", " ": " ",
+              "　": " ", " ": " ", " ": " ",
+              "‘": "'", "’": "'", "‚": "'", "‛": "'",
+              "“": '"', "”": '"', "„": '"', "‟": '"',
+              "–": "-", "—": "-", "−": "-", "‐": "-",
+              "…": "...",
+          }
+
+          total = 0
+          for path in ["alert_bot.py"]:
+              f = pathlib.Path(path)
+              if not f.exists():
+                  continue
+              src = f.read_text(encoding="utf-8")
+              found = {}
+              out = []
+              for ch in src:
+                  if ch in DELETE:
+                      found[ch] = found.get(ch, 0) + 1
+                      continue
+                  if ch in REPLACE:
+                      found[ch] = found.get(ch, 0) + 1
+                      out.append(REPLACE[ch])
+                      continue
+                  out.append(ch)
+              fixed = "".join(out)
+
+              if found:
+                  total += sum(found.values())
+                  print(f"{path}: repaired {sum(found.values())} bad character(s)")
+                  for ch, n in sorted(found.items()):
+                      # show the line numbers so you can fix the source too
+                      lines = sorted({src[:i].count(chr(10)) + 1
+                                      for i, c in enumerate(src) if c == ch})[:8]
+                      print(f"   U+{ord(ch):04X} {unicodedata.name(ch, '?'):<28} "
+                            f"x{n:<3} lines {lines}")
+                  f.write_text(fixed, encoding="utf-8")
+
+              # Whatever we could not fix, fail loudly rather than let Python
+              # produce a confusing error at import time.
+              leftover = sorted({c for c in fixed
+                                 if ord(c) > 126 and c not in "\n\r\t"})
+              if leftover:
+                  print(f"\n{path} still has non-ASCII characters:")
+                  for c in leftover[:12]:
+                      ln = fixed[:fixed.index(c)].count(chr(10)) + 1
+                      print(f"   U+{ord(c):04X} {unicodedata.name(c,'?')} at line {ln}")
+                  sys.exit("Re-paste the file - see mobile/PASTING.md")
+
+          print("no invisible characters found" if not total else
+                f"repaired {total} character(s) - fix the file in your repo too")
+          PY
+
+      - name: Run alert bot
+        env:
+          BROKER: ${{ vars.BROKER || 'kotak' }}
+
+          # --- Kotak Neo (default) ---
+          KOTAK_CONSUMER_KEY:    ${{ secrets.KOTAK_CONSUMER_KEY }}
+          KOTAK_CONSUMER_SECRET: ${{ secrets.KOTAK_CONSUMER_SECRET }}
+          KOTAK_MOBILE:          ${{ secrets.KOTAK_MOBILE }}
+          KOTAK_UCC:             ${{ secrets.KOTAK_UCC }}
+          KOTAK_MPIN:            ${{ secrets.KOTAK_MPIN }}
+          KOTAK_TOTP_SECRET:     ${{ secrets.KOTAK_TOTP_SECRET }}
+
+          # --- ICICI Direct Breeze (only if BROKER=breeze) ---
+          # The session token dies at midnight, so you must refresh this secret
+          # every morning. That is why Kotak is the default for live alerts.
+          BREEZE_API_KEY:        ${{ secrets.BREEZE_API_KEY }}
+          BREEZE_API_SECRET:     ${{ secrets.BREEZE_API_SECRET }}
+          BREEZE_SESSION_TOKEN:  ${{ secrets.BREEZE_SESSION_TOKEN }}
+
+          # --- notifications: set Telegram, ntfy, or both ---
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          NTFY_TOPIC:         ${{ secrets.NTFY_TOPIC }}
+
+          CAPITAL:          ${{ vars.CAPITAL || '300000' }}
+          PYTHONUNBUFFERED: '1'
+        run: python alert_bot.py
+
+      # Kotak Neo has no historical-candle API, so the bot builds its own 5m bars
+      # from live quotes and writes bars.csv. Committing it is what lets tomorrow
+      # start warm - without this step the bot re-warms from scratch every morning
+      # and cannot produce a valid signal until roughly 13:30.
+      - name: Save bar history
+        if: always() && (vars.BROKER || 'kotak') == 'kotak'
+        run: |
+          if [ -f bars.csv ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add bars.csv
+            git commit -m "bars: $(date -u +%Y-%m-%d)" || exit 0
+            git pull --rebase --autostash || true
+            git push
+          else
+            echo "no bars.csv produced"
+          fi
+
+  # GitHub silently disables scheduled workflows in repos with no activity for
+  # 60 days - you just stop getting alerts one morning with no warning. When
+  # BROKER=kotak the daily bars.csv commit already counts as activity; this job
+  # is the safety net for the Breeze path, which writes nothing.
+  keepalive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Weekly heartbeat
+        run: |
+          if [ "$(date -u +%u)" = "1" ]; then
+            date -u > .keepalive
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .keepalive
+            git commit -m "chore: keepalive" || exit 0
+            git pull --rebase --autostash || true
+            git push
+          fi
