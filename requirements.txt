@@ -1,0 +1,25 @@
+# Save this in your repo as:  requirements.txt   (repo root, next to alert_bot.py)
+#
+# Two reasons this file exists:
+#
+# 1. actions/setup-python with cache:'pip' needs a dependency file to build its
+#    cache key. Without one it fails with the misleading message
+#      "No file matched to [**/requirements.txt or **/pyproject.toml],
+#       make sure you have checked out the target repository"
+#    Checkout was fine - it just had nothing to hash.
+#
+# 2. More importantly: version ranges. This bot runs unattended for months. An
+#    unpinned `pip install pandas` will one day pull a new major version with a
+#    breaking change, and the first you'd know is a crashed job on a morning you
+#    wanted to trade. The upper bounds below stop that.
+ 
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+requests>=2.28,<3.0
+pyotp>=2.8,<3.0
+ 
+# Broker SDK is installed separately by the workflow, because which one you need
+# depends on the BROKER variable and the two are not worth installing together:
+#   BROKER=kotak   ->  kotakneoapi>=3.0.1   (v3+ required since the 15-Sep-2026
+#                                            market-feed migration)
+#   BROKER=breeze  ->  breeze-connect
